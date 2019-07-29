@@ -1,199 +1,315 @@
+#include "MemoryLeakDetection.h"
+
+#include <benchmark/benchmark.h>
 #include <windows.h>
+#include "ErrorMessages.h"
+#include "MemorySizes.h"
+#include "NativeArray.h"
+#include "NativeMemoryDefines.h"
+#include "PhysicalPages.h"
+#include "SystemInfo.h"
 
-//#include <ntdef.h>
-//
 
-#include <Sddl.h>
-#include <ntsecapi.h>
-#include <ntstatus.h>
-
-void InitLsaString(PLSA_UNICODE_STRING LsaString, LPCWSTR String)
+#ifdef BENCHMARK
+static void _malloc(benchmark::State& state)
 {
-        DWORD StringLength;
+        void* mem;
 
-        if (String == NULL)
+        for (auto _ : state)
         {
-                LsaString->Buffer        = NULL;
-                LsaString->Length        = 0;
-                LsaString->MaximumLength = 0;
+                mem = 0;
+                mem = malloc(state.range(0));
+                assert(mem);
+                free(mem);
+        }
+        state.iterations();
+}
+static void _valloc(benchmark::State& state)
+{
+        size_t page_size = GetMemoryInfo().PageSize;
+        for (auto _ : state)
+        {
+                void* mem;
+                bool  success;
+                mem             = 0;
+                size_t mem_size = RoundUpIntegerDivision(state.range(), page_size);
+                mem             = VirtualAlloc(0, state.range(0), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                assert(mem);
+                success = VirtualFree(mem, 0, MEM_RELEASE);
+                assert(success);
+                // state.counters["NumPages"] = Pages_Required(state.range(0), page_size);
+                // state.counters["MemSize"]  = mem_size;
+                // state.counters["PageSize"] = page_size;
+        }
+}
+static void _palloc(benchmark::State& state)
+{
+        size_t page_size = GetMemoryInfo().PageSize;
+        for (auto _ : state)
+        {
+                bool success;
+
+                ULONG_PTR  NumberOfPages = RoundUpIntegerDivision(state.range(), page_size);
+                ULONG_PTR* page_array    = new ULONG_PTR[NumberOfPages];
+                success                  = AllocateUserPhysicalPages(GetCurrentProcess(), &NumberOfPages, page_array);
+                assert(success);
+                success = FreeUserPhysicalPages(GetCurrentProcess(), &NumberOfPages, page_array);
+                assert(success);
+                delete[] page_array;
+                // state.counters["NumPages"] = NumberOfPages;
+                // state.counters["MemSize"]  = NumberOfPages * page_size;
+                // state.counters["PageSize"] = page_size;
+        }
+}
+static void _palloc_memset(benchmark::State& state)
+{
+        state.counters["Success"]         = 1;
+        size_t     page_size              = GetMemoryInfo().PageSize;
+        ULONG_PTR  NumberOfPagesRequested = RoundUpIntegerDivision(state.range(), page_size);
+        ULONG_PTR  NumberOfPagesRecieved  = NumberOfPagesRequested;
+        ULONG_PTR* page_array             = new ULONG_PTR[NumberOfPagesRequested];
+
+// SUCCESS defaults to false if unspecified
+#define cleanup(SUCCESS)                                                                             \
+        {                                                                                            \
+                bool success = {SUCCESS};                                                            \
+                if (!success)                                                                        \
+                {                                                                                    \
+                        DisplayErrorW();                                                             \
+                }                                                                                    \
+                if (!FreeUserPhysicalPages(GetCurrentProcess(), &NumberOfPagesRecieved, page_array)) \
+                        DisplayErrorW();                                                             \
+                delete[] page_array;                                                                 \
+                assert(success);                                                                     \
+        }
+
+        if (!AllocateUserPhysicalPages(GetCurrentProcess(), &NumberOfPagesRecieved, page_array))
+        {
+                cleanup();
+                return;
+        }
+        if (NumberOfPagesRequested != NumberOfPagesRecieved)
+        {
+                cleanup();
+                return;
+        }
+        void* lpMemReserved = VirtualAlloc(0, NumberOfPagesRecieved * page_size, MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE);
+        if (!lpMemReserved)
+        {
+                cleanup();
                 return;
         }
 
-        StringLength             = wcslen(String);
-        LsaString->Buffer        = (WCHAR*)malloc(StringLength * sizeof(WCHAR));
-        LPWSTR success           = lstrcpyW(LsaString->Buffer, String);
-        LsaString->Length        = (USHORT)StringLength * sizeof(WCHAR);
-        LsaString->MaximumLength = (USHORT)(StringLength + 1) * sizeof(WCHAR);
-}
+        // Map
+        if (!MapUserPhysicalPages(lpMemReserved, NumberOfPagesRecieved, page_array))
+        {
+                cleanup();
+                return;
+        }
 
-NTSTATUS OpenPolicy(LPWSTR ServerName, DWORD DesiredAccess, PLSA_HANDLE PolicyHandle)
+        for (auto _ : state) {}
+
+        // Unmap
+        if (!MapUserPhysicalPages(lpMemReserved, NumberOfPagesRecieved, 0))
+        {
+                cleanup();
+                return;
+        }
+
+        cleanup(1);
+
+#undef cleanup()
+}
+static void _malloc_memset(benchmark::State& state)
 {
-        LSA_OBJECT_ATTRIBUTES ObjectAttributes;
-        LSA_UNICODE_STRING    ServerString;
-        PLSA_UNICODE_STRING   Server = NULL;
-
-        //
-        // Always initialize the object attributes to all zeroes.
-        //
-        ZeroMemory(&ObjectAttributes, sizeof(ObjectAttributes));
-
-        if (ServerName != NULL)
-        {
-                //
-                // Make a LSA_UNICODE_STRING out of the LPWSTR passed in
-                //
-                InitLsaString(&ServerString, ServerName);
-                Server = &ServerString;
-        }
-
-        //
-        // Attempt to open the policy.
-        //
-        return LsaOpenPolicy(Server, &ObjectAttributes, DesiredAccess, PolicyHandle);
-        free(ServerString.Buffer);
+        void*     lpMemReserved         = 0;
+        size_t    page_size             = GetMemoryInfo().PageSize;
+        ULONG_PTR NumberOfPagesRecieved = RoundUpIntegerDivision(state.range(), page_size);
+        lpMemReserved                   = malloc(NumberOfPagesRecieved);
+        assert(lpMemReserved);
+        for (auto _ : state) {}
+        free(lpMemReserved);
 }
-
-NTSTATUS SetPrivilegeOnAccount(LSA_HANDLE PolicyHandle, PSID AccountSid, LPCWSTR PrivilegeName, BOOL bEnable)
+static void _valloc_memset(benchmark::State& state)
 {
-        LSA_UNICODE_STRING PrivilegeString;
-
-        //
-        // Create a LSA_UNICODE_STRING for the privilege name.
-        //
-        InitLsaString(&PrivilegeString, PrivilegeName);
-
-        //
-        // grant or revoke the privilege, accordingly
-        //
-        if (bEnable)
-        {
-                return LsaAddAccountRights(PolicyHandle,     // open policy handle
-                                           AccountSid,       // target SID
-                                           &PrivilegeString, // privileges
-                                           1                 // privilege count
-                );
-        }
-        else
-        {
-                return LsaRemoveAccountRights(PolicyHandle,     // open policy handle
-                                              AccountSid,       // target SID
-                                              FALSE,            // do not disable all rights
-                                              &PrivilegeString, // privileges
-                                              1                 // privilege count
-                );
-        }
+        void*     lpMemReserved         = 0;
+        size_t    page_size             = GetMemoryInfo().PageSize;
+        ULONG_PTR NumberOfPagesRecieved = RoundUpIntegerDivision(state.range(), page_size);
+        lpMemReserved = VirtualAlloc(0, NumberOfPagesRecieved * page_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        assert(lpMemReserved);
+        for (auto _ : state) {}
+        VirtualFree(lpMemReserved, 0, MEM_RELEASE);
 }
+#endif
+//
+// BENCHMARK(_malloc_memset)->Range(8, 500 * MiB);
+// BENCHMARK(_valloc_memset)->Range(8, 500 * MiB);
+// BENCHMARK(_palloc_memset)->Range(8, 500 * MiB);
+// BENCHMARK(_palloc)->Range(8, 500 * MiB);
+// BENCHMARK(_valloc)->Range(8, 500 * MiB);
+// BENCHMARK(_malloc)->Range(8, 500 * MiB);
+// BENCHMARK_MAIN();
+#include <tuple>
+#include "NativeArray2D.h"
+#include "PhysicalPageAllocator.h"
+
+T4X4_TAG(float, Quaternion);
+
+struct JobQueue
+{};
+
+
+#include <cmath>
+#include "NativeMemoryDefines.h"
+
+struct quad_int
+{
+        union
+        {
+                struct
+                {
+                        int32_t low;
+                        int32_t high;
+                };
+                uint64_t quad;
+        };
+};
+
+inline uint64_t rand64()
+{
+        quad_int _quad_int;
+        _quad_int.low  = rand();
+        _quad_int.high = rand();
+        return _quad_int.quad;
+}
+inline uint32_t rand32()
+{
+        return rand();
+}
+
+
+template <typename T, typename... Ts>
+void inplace_new(void* data, Ts&&... ts)
+{
+#pragma push_macro("new")
+#undef new
+        new (data) T(std::forward<Ts>(ts)...);
+#pragma pop_macro("new")
+}
+
+enum MessageEnum
+{
+        Construct,
+        Destroy,
+        Modify,
+        Deallocate,
+        Allocate
+};
+
+template <typename... MessageArgs>
+struct MessagePacker
+{
+        static void pack_message(void* _dst, MessageArgs... args)
+        {
+#pragma push_macro("new")
+#undef new
+                new (_dst) std::tuple<MessageArgs...>(std::forward<MessageArgs>(args)...);
+#pragma pop_macro("new")
+        }
+        static std::tuple<MessageArgs...>& unpack_message(void* _src)
+        {
+                return *static_cast<std::tuple<MessageArgs...>*>(_src);
+        }
+        static constexpr size_t sizeof_message()
+        {
+                return sizeof(std::tuple<MessageArgs...>);
+        }
+};
+
+template <typename PrefixType>
+struct MessagePrefixer
+{
+        static std::tuple<PrefixType, void*> UnpackMessagePrefix(void* _src)
+        {
+                PrefixType* _srcT         = static_cast<PrefixType*>(_src);
+                PrefixType  _prefix_value = *_srcT;
+                _srcT++;
+                return std::tuple<PrefixType, void*>{_prefix_value, _srcT};
+        }
+        static void* PackMessagePrefix(void* _dst, PrefixType prefixValue)
+        {
+                PrefixType* _dstT = static_cast<PrefixType*>(_dst);
+                *_dstT            = prefixValue;
+                _dstT++;
+                return static_cast<void*>(_dstT);
+				__builtin_prefet
+        }
+};
+
+
+using ComponentAllocator            = PhysicalPageMapAllocator<64, KiB * 64>;
+static void*      messageQueue      = (char*)malloc(KiB);
+NativeArray<char> messageQueueStack = NativeArray<char>(messageQueue, KiB);
+
+template <unsigned alignment>
+struct Stack
+{
+        void*    src;
+        unsigned head;
+		static const unsigned alignment()
+		{
+
+		}
+};
+
+template <typename C>
+struct Component
+{
+        using Allocator              = ComponentAllocator;
+        using ConstructMessagePacker = MessagePacker<C>;
+        using DestroyMessagePacker   = MessagePacker<C*>;
+        using MessagePrefixer        = MessagePrefixer<MessageEnum>;
+        static void defferedConstruct(C newData)
+        {
+                messageQueue = MessagePrefixer::PackMessagePrefix(messageQueue, MessageEnum::Construct);
+                ConstructMessagePacker::pack_message(messageQueue, newData);
+        }
+        static void defferedDestroy(C* location)
+        {
+                messageQueue = MessagePrefixer::PackMessagePrefix(messageQueue, MessageEnum::Destroy);
+                DestroyMessagePacker::pack_message(messageQueue, location);
+        }
+        static void inplaceCopyConstruct(void* _dst, void* _src)
+        {
+                *reinterpret_cast<C*>(_dst) = *reinterpret_cast<C*>(_src);
+        }
+};
+
+struct Position : public float3, Component<Position>
+{};
+
+struct Rotation : public float3, Component<Position>
+{};
 
 int main()
 {
-        HANDLE hToken = NULL;
+        using MessagePrefixer = MessagePrefixer<MessageEnum>;
 
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
-        {
-                MessageBox(0, L"failed OpenProcessToken", 0, 0);
 
-                return -1;
-        }
+        Position::defferedConstruct(Position{7, 13, 69});
+        Position::defferedConstruct(Position{5, 21, 18});
+        Position::defferedDestroy((Position*)0xdeadbeef);
+        Position::defferedConstruct(Position{1996, 14, 6});
 
-        DWORD dwBufferSize = 0;
+        auto [messageType, memoryPos] = MessagePrefixer::UnpackMessagePrefix(messageQueue);
 
-        // Probe the buffer size reqired for PTOKEN_USER structure
-        if (!GetTokenInformation(hToken, TokenUser, NULL, 0, &dwBufferSize) && (GetLastError() != ERROR_INSUFFICIENT_BUFFER))
-        {
+        auto [position] = Position::ConstructMessagePacker::unpack_message(memoryPos);
 
-                // Cleanup
-                CloseHandle(hToken);
-                hToken = NULL;
+        auto [position2] = Position::ConstructMessagePacker::unpack_message(memoryPos);
 
-                MessageBox(0, L"failed GetTokenInformation buffer size", 0, 0);
 
-                return -1;
-        }
+        memset(messageQueue, 0, KiB);
 
-        PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(dwBufferSize);
 
-        // Retrieve the token information in a TOKEN_USER structure
-        if (!GetTokenInformation(hToken, TokenUser, pTokenUser, dwBufferSize, &dwBufferSize))
-        {
-
-                // Cleanup
-                CloseHandle(hToken);
-                hToken = NULL;
-
-                MessageBox(0, L"failed GetTokenInformation", 0, 0);
-                return -1;
-        }
-
-        // Print SID string
-        LPWSTR strsid;
-        ConvertSidToStringSid(pTokenUser->User.Sid, &strsid);
-
-        // Cleanup
-        CloseHandle(hToken);
-        hToken = NULL;
-
-        NTSTATUS   status;
-        LSA_HANDLE policyHandle;
-
-        if (status = OpenPolicy(NULL, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, &policyHandle))
-        {
-                MessageBox(0, L"failed OpenPolicy, Run as administrator", 0, 0);
-                return -1;
-        }
-
-        // Add new privelege to the account
-        status = SetPrivilegeOnAccount(policyHandle, pTokenUser->User.Sid, SE_LOCK_MEMORY_NAME, TRUE);
-        if (status != STATUS_SUCCESS)
-        {
-                MessageBox(0, L"failed SetPrivilegeOnAccount", 0, 0);
-                return -1;
-        }
-
-        // Enable this priveledge for the current process
-        hToken = NULL;
-        TOKEN_PRIVILEGES tp;
-
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken))
-        {
-                MessageBox(0, L"failed OpenProcessToken", 0, 0);
-                return -1;
-        }
-
-        tp.PrivilegeCount           = 1;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-        if (!LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid))
-        {
-                MessageBox(0, L"failed LookupPrivilegeValue", 0, 0);
-                return -1;
-        }
-
-        BOOL  result = AdjustTokenPrivileges(hToken, FALSE, &tp, 0, (PTOKEN_PRIVILEGES)NULL, 0);
-        DWORD error  = GetLastError();
-
-        if (!result || (error != ERROR_SUCCESS))
-        {
-                MessageBox(0, L"failed AdjustTokenPrivileges, restart Computer", 0, 0);
-                CloseHandle(hToken);
-                return -1;
-        }
-
-        // Cleanup
-        CloseHandle(hToken);
-        hToken = NULL;
-
-        SIZE_T pageSize = GetLargePageMinimum();
-
-        // Finally allocate the memory
-        char* largeBuffer = (char*)VirtualAlloc(NULL, pageSize * 3, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
-        if (largeBuffer) {
-                MessageBox(0, L"success created Large Page Buffer", 0, 0);
-        }
-		else
-		{
-                MessageBox(0, L"failed create Large Page Buffer", 0, 0);
-		}
-        char* testBuffer = (char*)VirtualAlloc(0, 65536, MEM_64K_PAGES | MEM_RESERVE, PAGE_READWRITE);
-        error            = GetLastError();
-        int pause        = 0;
+        free(messageQueue);
 }
